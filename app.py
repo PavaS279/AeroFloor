@@ -9,24 +9,34 @@ from snowflake.snowpark import Session
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
+from snowflake.snowpark.exceptions import SnowparkSQLException
 
-# -----------------------------
-# CONFIGURE SNOWFLAKE CONNECTION
-# -----------------------------
-connection_parameters = {
-    "account": st.secrets.get("snowflake_account", st.text_input("Account (e.g., abcde-xy12345)", "")),
-    "user": st.secrets.get("snowflake_user", st.text_input("User", "")),
-    "password": st.secrets.get("snowflake_password", st.text_input("Password", type="password")),
-    "warehouse": "AEROFLOOR_WH",
-    "database": "AEROFLOOR_DB",
-    "schema": "LOGISTICS"
-}
+# Initialize Snowflake connection
+try:
+    cnx = st.connection("snowflake")
+    session = cnx.session()
+    SNOWFLAKE_AVAILABLE = True
+except Exception as e:
+    st.error(f"Snowflake connection failed: {e}")
+    SNOWFLAKE_AVAILABLE = False
 
-@st.cache_resource
-def get_session():
-    return Session.builder.configs(connection_parameters).create()
+# # -----------------------------
+# # CONFIGURE SNOWFLAKE CONNECTION
+# # -----------------------------
+# connection_parameters = {
+#     "account": st.secrets.get("snowflake_account", st.text_input("Account (e.g., abcde-xy12345)", "")),
+#     "user": st.secrets.get("snowflake_user", st.text_input("User", "")),
+#     "password": st.secrets.get("snowflake_password", st.text_input("Password", type="password")),
+#     "warehouse": "AEROFLOOR_WH",
+#     "database": "AEROFLOOR_DB",
+#     "schema": "LOGISTICS"
+# }
 
-session = get_session()
+# @st.cache_resource
+# def get_session():
+#     return Session.builder.configs(connection_parameters).create()
+
+# session = get_session()
 
 st.set_page_config(page_title="AeroFloor AI", layout="wide")
 st.title("🛫 AeroFloor AI — Streamlit + Snowflake Demo")

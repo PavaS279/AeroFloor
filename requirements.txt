@@ -1,0 +1,9 @@
+streamlit
+snowflake-snowpark-python
+snowflake-connector-python
+pandas
+numpy
+requests
+scikit-learn
+xgboost
+joblib

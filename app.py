@@ -64,14 +64,15 @@ def fetch_opensky(lamin, lomin, lamax, lomax, token=None):
     url = "https://opensky-network.org/api/states/all"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
     resp.raise_for_status()
     return resp.json().get("states", [])
 
 # ---------- UI: Flights ----------
 st.header("1) Live Flight Ingestion (OpenSky)")
 
-bbox = st.text_input("Bounding box (min_lat, min_lon, max_lat, max_lon)", "8.0,-10.0,75.0,100.0")
+bbox = st.text_input("Bounding box (min_lat, min_lon, max_lat, max_lon)", "10.0,70.0,20.0,80.0
+")
 col1, col2 = st.columns(2)
 with col1:
     use_auth = st.checkbox("Use OpenSky authenticated API (recommended)", value=bool(OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET))

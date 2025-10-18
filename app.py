@@ -71,8 +71,7 @@ def fetch_opensky(lamin, lomin, lamax, lomax, token=None):
 # ---------- UI: Flights ----------
 st.header("1) Live Flight Ingestion (OpenSky)")
 
-bbox = st.text_input("Bounding box (min_lat, min_lon, max_lat, max_lon)", "10.0,70.0,20.0,80.0
-")
+bbox = st.text_input("Bounding box (min_lat, min_lon, max_lat, max_lon)", "10.0,70.0,20.0,80.0")
 col1, col2 = st.columns(2)
 with col1:
     use_auth = st.checkbox("Use OpenSky authenticated API (recommended)", value=bool(OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET))

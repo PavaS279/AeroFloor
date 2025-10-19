@@ -50,8 +50,8 @@ except Exception:
 # ---------------------
 # OpenSky credentials from secrets
 # ---------------------
-OPENSKY_CLIENT_ID = st.secrets.get("opensky", {}).get("client_id") if "opensky" in st.secrets else None
-OPENSKY_CLIENT_SECRET = st.secrets.get("opensky", {}).get("client_secret") if "opensky" in st.secrets else None
+OPENSKY_CLIENT_ID = st.secrets["opensky"]["client_id"]
+OPENSKY_CLIENT_SECRET = st.secrets["opensky"]["client_secret"]
 
 def get_opensky_token(client_id, client_secret):
     token_url = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"

@@ -5,26 +5,25 @@ import numpy as np
 import requests
 import tempfile
 import joblib
-import uuid
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from snowflake.snowpark import Session
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
-from snowflake.snowpark.exceptions import SnowparkSQLException
 
-st.set_page_config(page_title="AeroFloor AI", layout="wide")
-st.title("AeroFloor — Predictive Logistics Meets Manufacturing")
+st.set_page_config(page_title="AeroFloor (Trail + Streamlit Cloud)", layout="wide")
+st.title("AeroFloor — Predictive Logistics Meets Manufacturing (Trail)")
 
-# ---------- Snowflake session helper ----------
-def get_snowflake_session():
-    # Prefer st.connection (Snowflake-native Streamlit)
+# ---------------------
+# SNOWFLAKE SESSION
+# - Prefer st.connection("snowflake") when using Snowflake-native Streamlit (not used here)
+# - For Streamlit Cloud we use st.secrets
+# ---------------------
+@st.cache_resource
+def get_session():
+    # Expect secrets in .streamlit/secrets.toml under [snowflake]
     try:
-        cnx = st.connection("snowflake")
-        session = cnx.session()
-        return session
-    except Exception:
-        # Fallback to using secrets for local/Streamlit Cloud
         params = {
             "account": st.secrets["snowflake"]["account"],
             "user": st.secrets["snowflake"]["user"],
@@ -33,22 +32,26 @@ def get_snowflake_session():
             "database": st.secrets.get("snowflake", {}).get("database", "AEROFLOOR_DB"),
             "schema": st.secrets.get("snowflake", {}).get("schema", "LOGISTICS")
         }
-        return Session.builder.configs(params).create()
+        session = Session.builder.configs(params).create()
+        return session
+    except Exception as e:
+        st.error(f"Snowflake session creation failed: {e}")
+        raise
 
-# Try to create session
-SNOWFLAKE_AVAILABLE = True
+# Try to create session and show status
 try:
-    session = get_snowflake_session()
-except Exception as e:
-    st.error(f"Snowflake session failed: {e}")
+    session = get_session()
+    SNOWFLAKE_AVAILABLE = True
+    st.sidebar.success("Connected to Snowflake")
+except Exception:
     SNOWFLAKE_AVAILABLE = False
-    session = None
+    st.sidebar.error("Could not connect to Snowflake. Add Snowflake secrets and restart.")
 
-# ---------- OpenSky auth ----------
-OPENSKY_CLIENT_ID = st.secrets.get("client_id")
-OPENSKY_CLIENT_SECRET = st.secrets.get("client_secret")
-# OPENSKY_CLIENT_ID = st.secrets.get("opensky", {}).get("client_id") if "opensky" in st.secrets else None
-# OPENSKY_CLIENT_SECRET = st.secrets.get("opensky", {}).get("client_secret") if "opensky" in st.secrets else None
+# ---------------------
+# OpenSky credentials from secrets
+# ---------------------
+OPENSKY_CLIENT_ID = st.secrets.get("opensky", {}).get("client_id") if "opensky" in st.secrets else None
+OPENSKY_CLIENT_SECRET = st.secrets.get("opensky", {}).get("client_secret") if "opensky" in st.secrets else None
 
 def get_opensky_token(client_id, client_secret):
     token_url = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
@@ -64,201 +67,299 @@ def fetch_opensky(lamin, lomin, lamax, lomax, token=None):
     url = "https://opensky-network.org/api/states/all"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
-    resp = requests.get(url, headers=headers, params=params, timeout=60)
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json().get("states", [])
 
-# ---------- UI: Flights ----------
-st.header("1) Live Flight Ingestion (OpenSky)")
+# ---------------------
+# Layout: tabs
+# ---------------------
+tabs = st.tabs(["Flights", "Manufacturing", "Model", "Alerts & Dashboards", "Admin"])
+tab_flights, tab_manuf, tab_model, tab_alerts, tab_admin = tabs
 
-bbox = st.text_input("Bounding box (min_lat, min_lon, max_lat, max_lon)", "10.0,70.0,20.0,80.0")
-col1, col2 = st.columns(2)
-with col1:
+# ---------------------
+# Flights: fetch OpenSky and save to Snowflake
+# ---------------------
+with tab_flights:
+    st.header("Live Flights — ingest OpenSky (from Streamlit)")
+    bbox = st.text_input("Bounding box (min_lat,min_lon,max_lat,max_lon)", "8.0,-10.0,75.0,100.0")
     use_auth = st.checkbox("Use OpenSky authenticated API (recommended)", value=bool(OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET))
-with col2:
-    ingest_btn = st.button("Fetch & Save Flights")
-
-if ingest_btn:
-    try:
-        lamin, lomin, lamax, lomax = [float(x.strip()) for x in bbox.split(",")]
-        token = None
-        if use_auth:
-            if not (OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET):
-                st.error("OpenSky credentials missing. Add to secrets or uncheck auth.")
-            else:
-                token = get_opensky_token(OPENSKY_CLIENT_ID, OPENSKY_CLIENT_SECRET)
-        states = fetch_opensky(lamin, lomin, lamax, lomax, token)
-        rows = []
-        for s in states:
-            if s[5] is None or s[6] is None:
-                continue
-            rows.append({
-                "icao24": s[0],
-                "callsign": s[1].strip() if s[1] else None,
-                "origin_country": s[2],
-                "longitude": float(s[5]),
-                "latitude": float(s[6]),
-                "baro_altitude": float(s[7]) if s[7] is not None else None,
-                "velocity": float(s[9]) if s[9] is not None else None,
-                "true_track": float(s[10]) if s[10] is not None else None,
-                "position_source": int(s[16]) if s[16] is not None else None,
-                "ingested_at": pd.Timestamp.utcnow()
-            })
-        df = pd.DataFrame(rows)
-        st.success(f"Fetched {len(df)} flights.")
-        if len(df) > 0:
-            st.map(df.rename(columns={"latitude":"lat","longitude":"lon"}))
-            if SNOWFLAKE_AVAILABLE:
-                sp_df = session.create_dataframe(df)
-                sp_df.write.mode("append").save_as_table("LOGISTICS.FLIGHT_TRACKING")
-                st.info("Saved to LOGISTICS.FLIGHT_TRACKING")
-            else:
-                st.info("Snowflake not available — showing preview only.")
-                st.dataframe(df.head())
-    except Exception as e:
-        st.error(f"Ingest failed: {e}")
-
-if st.button("Show recent flights (Snowflake)"):
-    if not SNOWFLAKE_AVAILABLE:
-        st.error("Snowflake not connected")
-    else:
+    if st.button("Fetch & Save Flights"):
         try:
-            df = session.sql("SELECT * FROM LOGISTICS.FLIGHT_TRACKING ORDER BY INGESTED_AT DESC LIMIT 200").to_pandas()
-            st.dataframe(df)
-            if len(df) > 0:
+            lamin, lomin, lamax, lomax = [float(x.strip()) for x in bbox.split(",")]
+            token = None
+            if use_auth:
+                if not (OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET):
+                    st.error("OpenSky credentials not configured in Streamlit secrets.")
+                else:
+                    token = get_opensky_token(OPENSKY_CLIENT_ID, OPENSKY_CLIENT_SECRET)
+            states = fetch_opensky(lamin, lomin, lamax, lomax, token)
+            rows = []
+            for s in states:
+                if s[5] is None or s[6] is None: 
+                    continue
+                rows.append({
+                    "icao24": s[0],
+                    "callsign": s[1].strip() if s[1] else None,
+                    "origin_country": s[2],
+                    "longitude": float(s[5]),
+                    "latitude": float(s[6]),
+                    "baro_altitude": float(s[7]) if s[7] is not None else None,
+                    "velocity": float(s[9]) if s[9] is not None else None,
+                    "true_track": float(s[10]) if s[10] is not None else None,
+                    "position_source": int(s[16]) if s[16] is not None else None,
+                    "ingested_at": pd.Timestamp.utcnow()
+                })
+            if len(rows) == 0:
+                st.info("No flight rows fetched.")
+            else:
+                df = pd.DataFrame(rows)
+                st.success(f"Fetched {len(df)} flights.")
                 st.map(df.rename(columns={"latitude":"lat","longitude":"lon"}))
+                if SNOWFLAKE_AVAILABLE:
+                    sp_df = session.create_dataframe(df)
+                    sp_df.write.mode("append").save_as_table("LOGISTICS.FLIGHT_TRACKING")
+                    st.info("Saved into LOGISTICS.FLIGHT_TRACKING")
+                else:
+                    st.warning("Snowflake not connected; local preview only.")
         except Exception as e:
-            st.error(e)
+            st.error(f"Fetch failed: {e}")
 
-# ---------- UI: Manufacturing ingestion ----------
-st.header("2) Manufacturing Data (UCI AI4I)")
-
-if st.button("Download & Ingest UCI AI4I"):
-    try:
-        csv_url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00601/ai4i2020.csv"
-        df = pd.read_csv(csv_url)
-        df_prepared = pd.DataFrame({
-            "machine_id": df["Product ID"].astype(str).str[:6],
-            "product_id": df["Product ID"].astype(str),
-            "type": df["Type"].astype(str),
-            "air_temperature_k": df["Air temperature [K]"].astype(float),
-            "process_temperature_k": df["Process temperature [K]"].astype(float),
-            "rotational_speed_rpm": df["Rotational speed [rpm]"].astype(float),
-            "torque_nm": df["Torque [Nm]"].astype(float),
-            "tool_wear_min": df["Tool wear [min]"].astype(float),
-            "machine_failure": df["Machine failure"].astype(bool),
-            "twf": df["TWF"].astype(bool),
-            "hdf": df["HDF"].astype(bool),
-            "pwf": df["PWF"].astype(bool),
-            "osf": df["OSF"].astype(bool),
-            "rnf": df["RNF"].astype(bool),
-            "timestamp": pd.Timestamp.utcnow() - pd.to_timedelta(np.arange(len(df))*5, unit="m")
-        })
-        if SNOWFLAKE_AVAILABLE:
-            sp_df = session.create_dataframe(df_prepared)
-            sp_df.write.mode("append").save_as_table("MANUFACTURING.SENSOR_DATA")
-            st.success(f"Inserted {len(df_prepared)} rows into MANUFACTURING.SENSOR_DATA")
+    if st.button("Show recent flights from Snowflake"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
         else:
-            st.dataframe(df_prepared.head())
-    except Exception as e:
-        st.error(f"Failed to ingest UCI dataset: {e}")
+            try:
+                pdf = session.sql("SELECT * FROM LOGISTICS.FLIGHT_TRACKING ORDER BY INGESTED_AT DESC LIMIT 500").to_pandas()
+                st.dataframe(pdf)
+                if not pdf.empty:
+                    st.map(pdf.rename(columns={"latitude":"lat","longitude":"lon"}))
+            except Exception as e:
+                st.error(e)
 
-if st.button("Preview Sensor Data"):
-    if not SNOWFLAKE_AVAILABLE:
-        st.error("Snowflake not connected")
-    else:
-        try:
-            df = session.sql("SELECT * FROM MANUFACTURING.SENSOR_DATA LIMIT 200").to_pandas()
-            st.dataframe(df)
-        except Exception as e:
-            st.error(e)
+# ---------------------
+# Manufacturing tab: (user already loaded sensor data)
+# ---------------------
+with tab_manuf:
+    st.header("Manufacturing — sensor data & stats (UCI AI4I)")
+    st.info("Using MANUFACTURING.SENSOR_DATA table already present in Snowflake (10k rows expected).")
+    if st.button("Show sample sensor rows"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                sample = session.sql("SELECT * FROM MANUFACTURING.SENSOR_DATA LIMIT 200").to_pandas()
+                st.dataframe(sample)
+                st.write("Summary statistics for numeric columns:")
+                st.dataframe(sample.select_dtypes(include=[np.number]).describe())
+            except Exception as e:
+                st.error(e)
 
-# ---------- UI: Train model ----------
-st.header("3) Train Failure Model & Upload")
+    if st.button("Sensor aggregated stats (by machine type)"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                agg = session.sql("""
+                    SELECT TYPE, COUNT(*) AS CNT,
+                           AVG(AIR_TEMPERATURE_K) AS AVG_AIR_K,
+                           AVG(PROCESS_TEMPERATURE_K) AS AVG_PROCESS_K,
+                           AVG(TOOL_WEAR_MIN) AS AVG_TOOL_WEAR
+                    FROM MANUFACTURING.SENSOR_DATA
+                    GROUP BY TYPE
+                    ORDER BY CNT DESC
+                    LIMIT 50
+                """).to_pandas()
+                st.dataframe(agg)
+            except Exception as e:
+                st.error(e)
 
-if st.button("Train & Upload Model"):
-    if not SNOWFLAKE_AVAILABLE:
-        st.error("Snowflake not connected")
-    else:
-        try:
-            query = """
-            SELECT AIR_TEMPERATURE_K, PROCESS_TEMPERATURE_K, ROTATIONAL_SPEED_RPM,
-                   TORQUE_NM, TOOL_WEAR_MIN,
-                   CASE WHEN TWF OR HDF OR PWF OR OSF OR RNF THEN 1 ELSE 0 END AS TARGET
-            FROM MANUFACTURING.SENSOR_DATA
-            LIMIT 5000
-            """
-            df = session.sql(query).to_pandas()
-            if df.shape[0] < 50:
-                st.error("Not enough rows to train (>=50 required).")
-            else:
-                X = df.drop("TARGET", axis=1).fillna(0)
-                y = df["TARGET"]
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
-                scaler = StandardScaler()
-                X_train_s = scaler.fit_transform(X_train)
-                X_test_s = scaler.transform(X_test)
-                model = XGBClassifier(n_estimators=100, max_depth=4, eval_metric="logloss", use_label_encoder=False)
-                model.fit(X_train_s, y_train)
-                acc = model.score(X_test_s, y_test)
-                st.success(f"Trained model. Test accuracy: {acc:.3f}")
+# ---------------------
+# Model: train on existing SENSOR_DATA, upload to stage, register, deploy UDF
+# ---------------------
+with tab_model:
+    st.header("Model — Train, Upload & Register")
+    st.write("Train a failure predictor using data already in MANUFACTURING.SENSOR_DATA (will use up to 5000 rows).")
+    train_now = st.button("Train model now (in Streamlit)")
+    if train_now:
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                df = session.sql("""
+                    SELECT AIR_TEMPERATURE_K, PROCESS_TEMPERATURE_K, ROTATIONAL_SPEED_RPM,
+                           TORQUE_NM, TOOL_WEAR_MIN,
+                           CASE WHEN TWF OR HDF OR PWF OR OSF OR RNF THEN 1 ELSE 0 END AS TARGET
+                    FROM MANUFACTURING.SENSOR_DATA
+                    LIMIT 5000
+                """).to_pandas()
+                if df.shape[0] < 50:
+                    st.error("Not enough rows to train.")
+                else:
+                    X = df.drop("TARGET", axis=1).fillna(0)
+                    y = df["TARGET"]
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+                    scaler = StandardScaler()
+                    X_train_s = scaler.fit_transform(X_train)
+                    X_test_s = scaler.transform(X_test)
+                    model = XGBClassifier(n_estimators=100, max_depth=4, eval_metric="logloss", use_label_encoder=False)
+                    model.fit(X_train_s, y_train)
+                    acc = model.score(X_test_s, y_test)
+                    st.success(f"Model trained. Test accuracy: {acc:.3f}")
 
-                tmp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-                joblib.dump({"model": model, "scaler": scaler, "features": X.columns.tolist()}, tmp.name)
+                    # Save model bundle to temporary file and upload to Snowflake internal stage
+                    tmp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+                    bundle = {"model": model, "scaler": scaler, "features": X.columns.tolist()}
+                    joblib.dump(bundle, tmp.name)
+                    tmp.close()
+                    # Upload to stage (overwrites previous)
+                    stage_path = "@ML_MODELS.ML_STAGE/failure_predictor/failure_predictor.pkl"
+                    session.file.put(tmp.name, stage_path, auto_compress=False, overwrite=True)
+                    st.info(f"Model uploaded to stage {stage_path}")
 
-                # upload to stage
-                session.file.put(tmp.name, "@ML_MODELS.ML_STAGE/failure_predictor/", auto_compress=False, overwrite=True)
-                session.sql(f"""
-                    INSERT INTO ML_MODELS.MODEL_REGISTRY
-                    (MODEL_NAME, MODEL_VERSION, MODEL_TYPE, TRAINING_DATE, METRICS, FEATURE_IMPORTANCE, MODEL_PATH)
-                    VALUES
-                    ('failure_predictor', 'v1.0', 'XGBClassifier', CURRENT_TIMESTAMP(),
-                     PARSE_JSON('{{"accuracy": {acc}}}'), PARSE_JSON('{{}}'),
-                     '@ML_MODELS.ML_STAGE/failure_predictor/{tmp.name.split('/')[-1]}')
-                """).collect()
-                st.info("Model uploaded and registered in MODEL_REGISTRY")
-        except Exception as e:
-            st.error(f"Training failed: {e}")
+                    # Register model metadata in MODEL_REGISTRY
+                    session.sql(f"""
+                        INSERT INTO ML_MODELS.MODEL_REGISTRY
+                        (MODEL_NAME, MODEL_VERSION, MODEL_TYPE, TRAINING_DATE, METRICS, FEATURE_IMPORTANCE, MODEL_PATH)
+                        VALUES ('failure_predictor', 'v1.0', 'XGBClassifier', CURRENT_TIMESTAMP(),
+                            PARSE_JSON('{{"accuracy": {acc}}}'),
+                            PARSE_JSON('{{}}'),
+                            '{stage_path}')
+                    """).collect()
+                    st.success("Model registered in ML_MODELS.MODEL_REGISTRY")
 
-# ---------- UI: Alerts & Prescriptions ----------
-st.header("4) Alerts & Prescriptive Insights (preview)")
+                    # Create/replace Python UDF that imports the model from stage and scores
+                    # Note: IMPORTS needs the object path exactly as uploaded to stage; Snowflake makes it available by basename.
+                    create_udf_sql = f"""
+CREATE OR REPLACE FUNCTION ML.SCORE_FAILURE(AIR_TEMP FLOAT, PROCESS_TEMP FLOAT, RPM FLOAT, TORQUE FLOAT, TOOL_WEAR FLOAT)
+RETURNS FLOAT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('scikit-learn','xgboost','joblib','numpy','pandas')
+HANDLER = 'score_handler'
+IMPORTS = ('@ML_MODELS.ML_STAGE/failure_predictor/failure_predictor.pkl')
+AS
+$$
+import joblib, numpy as np
+def score_handler(AIR_TEMP, PROCESS_TEMP, RPM, TORQUE, TOOL_WEAR):
+    bundle = joblib.load('failure_predictor.pkl')
+    scaler = bundle['scaler']
+    model = bundle['model']
+    features = np.array([[AIR_TEMP, PROCESS_TEMP, RPM, TORQUE, TOOL_WEAR]])
+    features_s = scaler.transform(features)
+    prob = model.predict_proba(features_s)[0,1]
+    return float(prob)
+$$;
+"""
+                    session.sql(create_udf_sql).collect()
+                    st.success("Created ML.SCORE_FAILURE UDF for in-Snowflake scoring.")
+            except Exception as e:
+                st.error(f"Training/upload failed: {e}")
 
-if st.button("Run sample alert generation"):
-    if not SNOWFLAKE_AVAILABLE:
-        st.error("Snowflake not connected")
-    else:
-        try:
-            # Example rule: if any flight within 50km of a plant AND any machine with tool_wear > threshold recently -> alert
-            alert_sql = """
-            WITH plant AS (
-                SELECT PLANT_ID, ST_MAKEPOINT(LONGITUDE, LATITUDE) AS PLANT_GEOM FROM LOGISTICS.PLANTS
-            ), flights_near AS (
-                SELECT f.*, p.PLANT_ID
-                FROM LOGISTICS.FLIGHT_TRACKING f
-                CROSS JOIN plant p
-                WHERE ST_DISTANCE(ST_MAKEPOINT(f.LONGITUDE, f.LATITUDE), p.PLANT_GEOM) < 50000
-            ), bad_machines AS (
-                SELECT MACHINE_ID, AVG(TOOL_WEAR_MIN) AS TOOL_WEAR_AVG
-                FROM MANUFACTURING.SENSOR_DATA
-                WHERE TIMESTAMP > DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
-                GROUP BY MACHINE_ID
-                HAVING AVG(TOOL_WEAR_MIN) > 200
-            )
-            INSERT INTO OPS.ALERTS (ALERT_ID, PLANT_ID, ALERT_TS, ALERT_LEVEL, ALERT_REASON, SUGGESTED_ACTION, META)
-            SELECT
-                UUID_STRING() as ALERT_ID,
-                fn.PLANT_ID,
-                CURRENT_TIMESTAMP(),
-                'HIGH',
-                'Inbound flight near plant + high tool wear on machines',
-                'Consider delaying non-critical shipments / expedite maintenance',
-                OBJECT_CONSTRUCT('flight_count', COUNT(*) OVER (), 'machines', (SELECT ARRAY_AGG(MACHINE_ID) FROM bad_machines))
-            FROM flights_near fn
-            LIMIT 1;
-            """
-            session.sql(alert_sql).collect()
-            st.success("Sample alert generated (inserted into OPS.ALERTS).")
-            alerted = session.sql("SELECT * FROM OPS.ALERTS ORDER BY ALERT_TS DESC LIMIT 20").to_pandas()
-            st.dataframe(alerted)
-        except Exception as e:
-            st.error(e)
+    # Allow ad-hoc scoring from UI using UDF
+    st.markdown("**Ad-hoc scoring (call in-Snowflake UDF)**")
+    colA, colB, colC, colD, colE = st.columns(5)
+    with colA:
+        a = st.number_input("Air temp (K)", value=300.0)
+    with colB:
+        b = st.number_input("Process temp (K)", value=310.0)
+    with colC:
+        c = st.number_input("RPM", value=1500.0)
+    with colD:
+        d = st.number_input("Torque", value=40.0)
+    with colE:
+        e_val = st.number_input("Tool wear", value=100.0)
+    if st.button("Score this row (UDF)"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                # safe call to UDF
+                res = session.sql(f"SELECT ML.SCORE_FAILURE({a},{b},{c},{d},{e_val}) AS PROB").to_pandas()
+                st.write("Predicted failure probability:", float(res["PROB"].iloc[0]))
+            except Exception as ex:
+                st.error(f"UDF call failed: {ex}")
+
+# ---------------------
+# Alerts & Dashboards
+# ---------------------
+with tab_alerts:
+    st.header("Alerts & Dashboards")
+    st.markdown("This tab shows summary metrics and a simple alert generator combining flights near plants and machine wear stats.")
+    if st.button("Flight summary (by country)"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                fs = session.sql("SELECT * FROM LOGISTICS.FLIGHT_SUMMARY ORDER BY TOTAL_FLIGHTS DESC LIMIT 100").to_pandas()
+                st.dataframe(fs)
+            except Exception as e:
+                st.error(e)
+
+    if st.button("Generate sample alert (insert into OPS.ALERTS)"):
+        if not SNOWFLAKE_AVAILABLE:
+            st.error("Snowflake not connected.")
+        else:
+            try:
+                # Very simple rule: flights within 50km + avg tool wear in last 2 hours > threshold
+                alert_sql = """
+                WITH plant AS (
+                  SELECT PLANT_ID, ST_MAKEPOINT(LONGITUDE, LATITUDE) AS PLANT_GEOM FROM LOGISTICS.PLANTS
+                ), flights_near AS (
+                  SELECT f.*, p.PLANT_ID
+                  FROM LOGISTICS.FLIGHT_TRACKING f
+                  CROSS JOIN plant p
+                  WHERE ST_DISTANCE(ST_MAKEPOINT(f.LONGITUDE, f.LATITUDE), p.PLANT_GEOM) < 50000
+                ), recent_wear AS (
+                  SELECT MACHINE_ID, AVG(TOOL_WEAR_MIN) AS AVG_WEAR
+                  FROM MANUFACTURING.SENSOR_DATA
+                  WHERE TIMESTAMP > DATEADD(HOUR, -2, CURRENT_TIMESTAMP())
+                  GROUP BY MACHINE_ID
+                  HAVING AVG(TOOL_WEAR_MIN) > 200
+                )
+                INSERT INTO OPS.ALERTS (ALERT_ID, PLANT_ID, ALERT_TS, ALERT_LEVEL, ALERT_REASON, SUGGESTED_ACTION, META)
+                SELECT
+                  UUID_STRING(),
+                  FN.PLANT_ID,
+                  CURRENT_TIMESTAMP(),
+                  'HIGH',
+                  'Inbound flights near plant AND machines with high tool wear in last 2 hours',
+                  'Prioritize inspections; delay non-critical shipments',
+                  OBJECT_CONSTRUCT('flights', COUNT(*) OVER (), 'machines_high_wear', (SELECT ARRAY_AGG(MACHINE_ID) FROM recent_wear))
+                FROM flights_near FN
+                LIMIT 1;
+                """
+                session.sql(alert_sql).collect()
+                st.success("Alert inserted into OPS.ALERTS (if rule conditions met).")
+                alerts = session.sql("SELECT * FROM OPS.ALERTS ORDER BY ALERT_TS DESC LIMIT 20").to_pandas()
+                st.dataframe(alerts)
+            except Exception as e:
+                st.error(e)
+
+# ---------------------
+# Admin tab: utility SQL and instructions
+# ---------------------
+with tab_admin:
+    st.header("Admin / Utilities")
+    st.markdown("Use these utilities to verify and manage database objects.")
+
+    if st.button("Show MODEL_REGISTRY"):
+        if SNOWFLAKE_AVAILABLE:
+            try:
+                mr = session.sql("SELECT * FROM ML_MODELS.MODEL_REGISTRY ORDER BY TRAINING_DATE DESC").to_pandas()
+                st.dataframe(mr)
+            except Exception as e:
+                st.error(e)
+
+    if st.button("Show ALERTS"):
+        if SNOWFLAKE_AVAILABLE:
+            try:
+                al = session.sql("SELECT * FROM OPS.ALERTS ORDER BY ALERT_TS DESC LIMIT 200").to_pandas()
+                st.dataframe(al)
+            except Exception as e:
+                st.error(e)
+
+    st.markdown("**Notes**")
+    st.write("- This app calls OpenSky from Streamlit (required for Snowflake trial).")
+    st.write("- The app trains models in Streamlit environment and uploads artifacts to Snowflake internal stage.")
+    st.write("- After uploading, the app creates a Python UDF ML.SCORE_FAILURE that imports the model from stage and is callable from SQL.")
